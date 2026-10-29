@@ -1,19 +1,7 @@
 #include <Arduino.h>
 #include <Wire.h>
-#include <WiFi.h>
-#include <WiFiClientSecure.h>
-#include <HTTPClient.h>
-#include <ArduinoJson.h>
 #include <U8g2lib.h>
-#include <time.h>
-
-// Set these values for your Wi-Fi, local time offset, and weather location.
-constexpr char WIFI_SSID[] = "Samsungsmartfridge";
-constexpr char WIFI_PASSWORD[] = "zxcvbnm123";
-constexpr float WEATHER_LATITUDE = 18.52f;
-constexpr float WEATHER_LONGITUDE = 73.85f;
-constexpr bool WEATHER_LOCATION_CONFIGURED = true;
-constexpr long UTC_OFFSET_SECONDS = 19800;
+#include <ChronosESP32.h>
 
 constexpr uint8_t BUTTON_LEFT_PIN = 2;
 constexpr uint8_t BUTTON_RIGHT_PIN = 3;
@@ -24,23 +12,26 @@ constexpr uint8_t OLED_SCL_PIN = 5;
 constexpr uint32_t SAMPLE_INTERVAL_MS = 20;
 constexpr uint32_t GRAPH_INTERVAL_MS = 50;
 constexpr uint32_t DISPLAY_INTERVAL_MS = 150;
-constexpr uint32_t WEATHER_INTERVAL_MS = 15UL * 60UL * 1000UL;
-constexpr uint32_t WIFI_RETRY_INTERVAL_MS = 15000;
 constexpr uint32_t BUTTON_DEBOUNCE_MS = 30;
 constexpr uint32_t SELECT_LONG_PRESS_MS = 900;
 constexpr uint32_t MIN_BEAT_INTERVAL_MS = 300;
 constexpr uint32_t MAX_BEAT_INTERVAL_MS = 2000;
+constexpr uint32_t FOCUS_DURATION_MS = 25UL * 60UL * 1000UL;
 constexpr size_t GRAPH_WIDTH = 128;
 
 U8G2_SH1106_128X64_NONAME_F_HW_I2C display(U8G2_R0, U8X8_PIN_NONE);
+ChronosESP32 watch("ESP32 OLED Watch");
 
 enum class Mode : uint8_t {
   Clock,
   HeartRate,
   Weather,
+  Music,
+  Notifications,
   Stopwatch,
   Calendar,
-  System,
+  FocusTimer,
+  Device,
   Count
 };
 
@@ -59,6 +50,26 @@ ButtonState buttons[] = {
     {BUTTON_SELECT_PIN, true, true, false, 0, 0},
 };
 
+constexpr uint8_t MODE_COUNT = static_cast<uint8_t>(Mode::Count);
+constexpr uint8_t MENU_STOPWATCH_TOGGLE = MODE_COUNT;
+constexpr uint8_t MENU_STOPWATCH_RESET = MODE_COUNT + 1;
+constexpr uint8_t MENU_MUSIC_TOGGLE = MODE_COUNT + 2;
+constexpr uint8_t MENU_MUSIC_PREVIOUS = MODE_COUNT + 3;
+constexpr uint8_t MENU_MUSIC_NEXT = MODE_COUNT + 4;
+constexpr uint8_t MENU_VOLUME_UP = MODE_COUNT + 5;
+constexpr uint8_t MENU_VOLUME_DOWN = MODE_COUNT + 6;
+constexpr uint8_t MENU_FOCUS_PRESET_START = MODE_COUNT + 7;
+constexpr uint8_t FOCUS_PRESET_COUNT = 4;
+constexpr uint8_t MENU_ITEM_COUNT = MENU_FOCUS_PRESET_START + FOCUS_PRESET_COUNT;
+const uint8_t FOCUS_PRESET_MINUTES[FOCUS_PRESET_COUNT] = {5, 15, 25, 45};
+const char *const MODE_NAMES[MODE_COUNT] = {
+  "Clock", "Heart rate", "Chronos weather", "Music", "Notifications",
+  "Stopwatch", "Calendar", "Focus timer", "Device status"
+};
+const char *const WEEKDAYS[] = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
+const char *const MONTHS[] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                              "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
+
 uint16_t graph[GRAPH_WIDTH] = {};
 size_t graphPosition = 0;
 bool graphFilled = false;
@@ -71,37 +82,45 @@ uint16_t heartRate = 0;
 uint32_t lastSampleTime = 0;
 uint32_t lastGraphTime = 0;
 uint32_t lastDisplayTime = 0;
-Mode currentMode = Mode::Clock;
-bool use24HourClock = true;
-bool stopwatchRunning = false;
 uint32_t stopwatchStartedAt = 0;
 uint32_t stopwatchElapsedMs = 0;
-volatile bool weatherReady = false;
-volatile bool weatherFetching = false;
-volatile bool weatherRefreshRequested = false;
-float weatherTemperatureC = 0.0f;
-int weatherCode = -1;
-uint32_t lastWeatherRequest = 0;
-uint32_t lastWifiAttempt = 0;
-volatile uint8_t lastWifiDisconnectReason = 0;
+uint32_t lastLapElapsedMs = 0;
+uint32_t stopwatchLapMarkMs = 0;
+uint32_t focusStartedAt = 0;
+uint32_t focusDurationMs = FOCUS_DURATION_MS;
+uint32_t focusRemainingMs = FOCUS_DURATION_MS;
+uint8_t lapCount = 0;
+uint8_t menuSelection = 0;
+uint8_t notificationIndex = 0;
+Mode currentMode = Mode::Clock;
+bool menuOpen = false;
+bool use24HourClock = true;
+bool stopwatchRunning = false;
+bool focusRunning = false;
+volatile bool chronosTimeSynced = false;
+volatile bool notificationReceived = false;
+bool chronosSyncRequested = false;
 
-void samplePulseSensor(uint32_t now);
-void addGraphSample(uint16_t sample);
 void updateButtons(uint32_t now);
 void handleSelect(bool longPress);
+void samplePulseSensor(uint32_t now);
+void addGraphSample(uint16_t sample);
+void updateFocusTimer(uint32_t now);
 void drawScreen(uint32_t now);
+void drawMenu();
 void drawClock(bool showDate);
 void drawHeartRate(uint32_t now);
 void drawWeather();
 void drawStopwatch(uint32_t now);
-void drawCalendar();
-void drawSystem(uint32_t now);
+void drawFocusTimer(uint32_t now);
+void drawDevice(uint32_t now);
+void drawMusic();
+void drawNotifications();
 void drawHeader(const char *title);
-void weatherWorker(void *parameter);
-void maintainWiFi(uint32_t now);
-void onWiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info);
-const char *wifiStatusText();
-const char *weatherDescription(int code);
+void onChronosConnection(bool connected);
+void onChronosNotification(Notification notification);
+void onChronosConfiguration(Config config, uint32_t a, uint32_t b);
+const char *chronosWeatherDescription(int icon);
 
 void setup() {
   Serial.begin(115200);
@@ -116,7 +135,17 @@ void setup() {
 
   Wire.begin(OLED_SDA_PIN, OLED_SCL_PIN);
   display.begin();
+  display.setContrast(190);
   display.setFont(u8g2_font_6x10_tf);
+
+  watch.setConnectionCallback(onChronosConnection);
+  watch.setNotificationCallback(onChronosNotification);
+  watch.setConfigurationCallback(onChronosConfiguration);
+  watch.set24Hour(use24HourClock);
+  watch.clearNotifications();
+  watch.begin();
+  Serial.println("Pair in Chronos app: Watches > Pair New Devices > Search.");
+  Serial.println("Do not pair from the phone's Bluetooth settings.");
 
   rawSample = analogRead(SENSOR_PIN);
   baseline = rawSample;
@@ -124,35 +153,32 @@ void setup() {
   lastGraphTime = lastSampleTime;
   lastDisplayTime = lastSampleTime;
 
-  if (WIFI_SSID[0] != '\0') {
-    WiFi.mode(WIFI_STA);
-    WiFi.persistent(false);
-    WiFi.setSleep(false);
-    WiFi.setAutoReconnect(true);
-    WiFi.onEvent(onWiFiEvent);
-    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-    lastWifiAttempt = millis();
-    Serial.println("Wi-Fi: connecting to configured access point");
-    configTime(UTC_OFFSET_SECONDS, 0, "pool.ntp.org", "time.nist.gov");
-    xTaskCreate(weatherWorker, "weather", 8192, nullptr, 1, nullptr);
-  }
 }
 
 void loop() {
   const uint32_t now = millis();
+  watch.loop();
+  if (watch.isConnected() && !chronosSyncRequested) {
+    watch.syncRequest();
+    chronosSyncRequested = true;
+  } else if (!watch.isConnected()) {
+    chronosSyncRequested = false;
+  }
+  if (notificationReceived) {
+    notificationIndex = 0;
+    notificationReceived = false;
+  }
   updateButtons(now);
-  maintainWiFi(now);
+  updateFocusTimer(now);
 
   if (now - lastSampleTime >= SAMPLE_INTERVAL_MS) {
     lastSampleTime = now;
     samplePulseSensor(now);
   }
-
   if (now - lastGraphTime >= GRAPH_INTERVAL_MS) {
     lastGraphTime = now;
     addGraphSample(rawSample);
   }
-
   if (now - lastDisplayTime >= DISPLAY_INTERVAL_MS) {
     lastDisplayTime = now;
     drawScreen(now);
@@ -167,7 +193,6 @@ void updateButtons(uint32_t now) {
       button.lastReadingHigh = readingHigh;
       button.lastChangeTime = now;
     }
-
     if (readingHigh != button.stableHigh &&
         now - button.lastChangeTime >= BUTTON_DEBOUNCE_MS) {
       button.stableHigh = readingHigh;
@@ -175,18 +200,33 @@ void updateButtons(uint32_t now) {
         button.pressedAt = now;
         button.longPressHandled = false;
         if (i == 0) {
-          currentMode = static_cast<Mode>(
-              (static_cast<uint8_t>(currentMode) + static_cast<uint8_t>(Mode::Count) - 1) %
-              static_cast<uint8_t>(Mode::Count));
+          if (menuOpen) {
+            menuSelection = (menuSelection + MENU_ITEM_COUNT - 1) % MENU_ITEM_COUNT;
+          } else if (currentMode == Mode::Music) {
+            if (watch.isConnected()) watch.musicControl(MUSIC_PREVIOUS);
+          } else if (currentMode == Mode::Notifications) {
+            const int count = watch.getNotificationCount();
+            if (count > 0 && notificationIndex + 1 < count) ++notificationIndex;
+          } else {
+            currentMode = static_cast<Mode>(
+                (static_cast<uint8_t>(currentMode) + MODE_COUNT - 1) % MODE_COUNT);
+          }
         } else if (i == 1) {
-          currentMode = static_cast<Mode>(
-              (static_cast<uint8_t>(currentMode) + 1) % static_cast<uint8_t>(Mode::Count));
+          if (menuOpen) {
+            menuSelection = (menuSelection + 1) % MENU_ITEM_COUNT;
+          } else if (currentMode == Mode::Music) {
+            if (watch.isConnected()) watch.musicControl(MUSIC_NEXT);
+          } else if (currentMode == Mode::Notifications) {
+            if (notificationIndex > 0) --notificationIndex;
+          } else {
+            currentMode = static_cast<Mode>(
+                (static_cast<uint8_t>(currentMode) + 1) % MODE_COUNT);
+          }
         }
       } else if (i == 2 && !button.longPressHandled) {
         handleSelect(false);
       }
     }
-
     if (i == 2 && !button.stableHigh && !button.longPressHandled &&
         now - button.pressedAt >= SELECT_LONG_PRESS_MS) {
       button.longPressHandled = true;
@@ -196,20 +236,79 @@ void updateButtons(uint32_t now) {
 }
 
 void handleSelect(bool longPress) {
-  if (currentMode == Mode::Clock && !longPress) {
-    use24HourClock = !use24HourClock;
-  } else if (currentMode == Mode::Weather) {
-    weatherRefreshRequested = true;
-  } else if (currentMode == Mode::Stopwatch) {
-    if (longPress) {
+  if (longPress) {
+    if (!menuOpen) {
+      menuSelection = static_cast<uint8_t>(currentMode);
+    }
+    menuOpen = !menuOpen;
+    return;
+  }
+
+  if (menuOpen) {
+    if (menuSelection < MODE_COUNT) {
+      currentMode = static_cast<Mode>(menuSelection);
+    } else if (menuSelection == MENU_STOPWATCH_TOGGLE) {
+      if (stopwatchRunning) {
+        stopwatchElapsedMs += millis() - stopwatchStartedAt;
+        stopwatchRunning = false;
+      } else {
+        stopwatchStartedAt = millis();
+        stopwatchRunning = true;
+      }
+    } else if (menuSelection == MENU_STOPWATCH_RESET) {
       stopwatchRunning = false;
       stopwatchElapsedMs = 0;
-    } else if (stopwatchRunning) {
-      stopwatchElapsedMs += millis() - stopwatchStartedAt;
-      stopwatchRunning = false;
+      lastLapElapsedMs = 0;
+      stopwatchLapMarkMs = 0;
+      lapCount = 0;
+    } else if (menuSelection == MENU_MUSIC_TOGGLE) {
+      if (watch.isConnected()) watch.musicControl(MUSIC_TOGGLE);
+    } else if (menuSelection == MENU_MUSIC_PREVIOUS) {
+      if (watch.isConnected()) watch.musicControl(MUSIC_PREVIOUS);
+    } else if (menuSelection == MENU_MUSIC_NEXT) {
+      if (watch.isConnected()) watch.musicControl(MUSIC_NEXT);
+    } else if (menuSelection == MENU_VOLUME_UP) {
+      if (watch.isConnected()) watch.musicControl(VOLUME_UP);
+    } else if (menuSelection == MENU_VOLUME_DOWN) {
+      if (watch.isConnected()) watch.musicControl(VOLUME_DOWN);
+    } else {
+      focusRunning = false;
+      const uint8_t presetIndex = menuSelection - MENU_FOCUS_PRESET_START;
+      focusDurationMs = FOCUS_PRESET_MINUTES[presetIndex] * 60UL * 1000UL;
+      focusRemainingMs = focusDurationMs;
+      currentMode = Mode::FocusTimer;
+    }
+    menuOpen = false;
+    return;
+  }
+
+  if (currentMode == Mode::Clock) {
+    use24HourClock = !use24HourClock;
+    watch.set24Hour(use24HourClock);
+  } else if (currentMode == Mode::Music) {
+    if (watch.isConnected()) watch.musicControl(MUSIC_TOGGLE);
+  } else if (currentMode == Mode::Notifications) {
+    watch.clearNotifications();
+    notificationIndex = 0;
+  } else if (currentMode == Mode::Stopwatch) {
+    if (stopwatchRunning) {
+      const uint32_t elapsed = stopwatchElapsedMs + millis() - stopwatchStartedAt;
+      lastLapElapsedMs = elapsed - stopwatchLapMarkMs;
+      stopwatchLapMarkMs = elapsed;
+      stopwatchElapsedMs = elapsed;
+      stopwatchStartedAt = millis();
+      ++lapCount;
     } else {
       stopwatchStartedAt = millis();
       stopwatchRunning = true;
+    }
+  } else if (currentMode == Mode::FocusTimer) {
+    if (focusRunning) {
+      focusRemainingMs -= millis() - focusStartedAt;
+      focusRunning = false;
+    } else if (focusRemainingMs > 0) {
+      focusStartedAt = millis();
+      focusRunning = true;
     }
   }
 }
@@ -246,81 +345,136 @@ void addGraphSample(uint16_t sample) {
   }
 }
 
+void updateFocusTimer(uint32_t now) {
+  if (!focusRunning) return;
+  const uint32_t elapsed = now - focusStartedAt;
+  if (elapsed >= focusRemainingMs) {
+    focusRemainingMs = 0;
+    focusRunning = false;
+  }
+}
+
 void drawScreen(uint32_t now) {
   display.clearBuffer();
-  switch (currentMode) {
-    case Mode::Clock: drawClock(false); break;
-    case Mode::HeartRate: drawHeartRate(now); break;
-    case Mode::Weather: drawWeather(); break;
-    case Mode::Stopwatch: drawStopwatch(now); break;
-    case Mode::Calendar: drawCalendar(); break;
-    case Mode::System: drawSystem(now); break;
-    case Mode::Count: currentMode = Mode::Clock; drawClock(false); break;
+  if (menuOpen) {
+    drawMenu();
+  } else {
+    switch (currentMode) {
+      case Mode::Clock: drawClock(false); break;
+      case Mode::HeartRate: drawHeartRate(now); break;
+      case Mode::Weather: drawWeather(); break;
+      case Mode::Music: drawMusic(); break;
+      case Mode::Notifications: drawNotifications(); break;
+      case Mode::Stopwatch: drawStopwatch(now); break;
+      case Mode::Calendar: drawClock(true); break;
+      case Mode::FocusTimer: drawFocusTimer(now); break;
+      case Mode::Device: drawDevice(now); break;
+      case Mode::Count: currentMode = Mode::Clock; drawClock(false); break;
+    }
   }
   display.sendBuffer();
 }
 
 void drawHeader(const char *title) {
+  display.setDrawColor(1);
+  display.drawBox(0, 0, 128, 14);
+  display.setDrawColor(0);
   display.setFont(u8g2_font_6x10_tf);
-  display.drawStr(0, 9, title);
-  display.drawHLine(0, 12, 128);
+  display.drawStr(4, 10, title);
+  char page[8];
+  snprintf(page, sizeof(page), "%u/%u", static_cast<unsigned>(currentMode) + 1,
+           static_cast<unsigned>(MODE_COUNT));
+  display.drawStr(104, 10, page);
+  display.setDrawColor(1);
+}
+
+void drawMenu() {
+  display.setDrawColor(1);
+  display.drawBox(0, 0, 128, 14);
+  display.setDrawColor(0);
+  display.setFont(u8g2_font_6x10_tf);
+  display.drawStr(4, 10, "WATCH MENU");
+  display.drawStr(96, 10, "L/R");
+  display.setDrawColor(1);
+
+  uint8_t firstItem = menuSelection > 1 ? menuSelection - 1 : 0;
+  if (firstItem + 4 > MENU_ITEM_COUNT) firstItem = MENU_ITEM_COUNT - 4;
+  for (uint8_t row = 0; row < 4; ++row) {
+    const uint8_t item = firstItem + row;
+    const uint8_t y = 16 + row * 11;
+    if (item == menuSelection) {
+      display.drawBox(2, y, 124, 10);
+      display.setDrawColor(0);
+    }
+    display.setFont(u8g2_font_6x10_tf);
+    if (item < MODE_COUNT) {
+      display.drawStr(7, y + 8, MODE_NAMES[item]);
+    } else {
+      const char *actionName = "Action";
+      char presetName[20];
+      if (item == MENU_STOPWATCH_TOGGLE) {
+        actionName = stopwatchRunning ? "Pause stopwatch" : "Resume stopwatch";
+      } else if (item == MENU_STOPWATCH_RESET) {
+        actionName = "Reset stopwatch";
+      } else if (item == MENU_MUSIC_TOGGLE) {
+        actionName = "Play / pause music";
+      } else if (item == MENU_MUSIC_PREVIOUS) {
+        actionName = "Previous track";
+      } else if (item == MENU_MUSIC_NEXT) {
+        actionName = "Next track";
+      } else if (item == MENU_VOLUME_UP) {
+        actionName = "Volume up";
+      } else if (item == MENU_VOLUME_DOWN) {
+        actionName = "Volume down";
+      } else if (item >= MENU_FOCUS_PRESET_START) {
+        const uint8_t presetIndex = item - MENU_FOCUS_PRESET_START;
+        snprintf(presetName, sizeof(presetName), "Focus: %u minutes",
+                 FOCUS_PRESET_MINUTES[presetIndex]);
+        actionName = presetName;
+      }
+      display.drawStr(7, y + 8, actionName);
+    }
+    if (item == menuSelection) display.setDrawColor(1);
+  }
+  display.setFont(u8g2_font_5x8_tf);
+  display.drawStr(3, 62, "SEL open  HOLD close");
 }
 
 void drawClock(bool showDate) {
   drawHeader(showDate ? "CALENDAR" : "CLOCK");
-  const time_t epoch = time(nullptr);
-  if (epoch < 1700000000) {
+  if (!chronosTimeSynced) {
     display.setFont(u8g2_font_helvB14_tf);
     display.drawStr(8, 39, "--:--:--");
     display.setFont(u8g2_font_6x10_tf);
-    display.drawStr(8, 55, WIFI_SSID[0] == '\0' ? "Set Wi-Fi in sketch" : "Syncing time...");
+    display.drawStr(8, 52, watch.isConnected() ? "Syncing from Chronos..." : "Connect Chronos app");
+    display.setFont(u8g2_font_5x8_tf);
+    display.drawStr(3, 63, "HOLD menu");
     return;
   }
 
-  struct tm localTime;
-  localtime_r(&epoch, &localTime);
-  char timeText[16];
-  const int hour = use24HourClock ? localTime.tm_hour : ((localTime.tm_hour + 11) % 12 + 1);
-  snprintf(timeText, sizeof(timeText), "%02d:%02d:%02d", hour,
-           localTime.tm_min, localTime.tm_sec);
+  const String timeText = watch.getHourZ() + watch.getTime(":%M:%S ") + watch.getAmPmC();
   display.setFont(u8g2_font_helvB18_tf);
-  display.drawStr(4, 39, timeText);
+  display.drawStr(4, 38, timeText.c_str());
 
-  char dateText[24];
-  snprintf(dateText, sizeof(dateText), "%s  %02d %s %04d",
-           localTime.tm_wday == 0 ? "Sun" : localTime.tm_wday == 1 ? "Mon" :
-           localTime.tm_wday == 2 ? "Tue" : localTime.tm_wday == 3 ? "Wed" :
-           localTime.tm_wday == 4 ? "Thu" : localTime.tm_wday == 5 ? "Fri" : "Sat",
-           localTime.tm_mday,
-           localTime.tm_mon == 0 ? "Jan" : localTime.tm_mon == 1 ? "Feb" :
-           localTime.tm_mon == 2 ? "Mar" : localTime.tm_mon == 3 ? "Apr" :
-           localTime.tm_mon == 4 ? "May" : localTime.tm_mon == 5 ? "Jun" :
-           localTime.tm_mon == 6 ? "Jul" : localTime.tm_mon == 7 ? "Aug" :
-           localTime.tm_mon == 8 ? "Sep" : localTime.tm_mon == 9 ? "Oct" :
-           localTime.tm_mon == 10 ? "Nov" : "Dec", localTime.tm_year + 1900);
+  const String dateText = watch.getTime("%a  %d %b %Y");
   display.setFont(u8g2_font_6x10_tf);
-  display.drawStr(15, 57, dateText);
-  if (!use24HourClock) {
-    display.drawStr(104, 24, localTime.tm_hour < 12 ? "AM" : "PM");
-  }
+  display.drawStr(15, 52, dateText.c_str());
+  display.setFont(u8g2_font_5x8_tf);
+  display.drawStr(3, 63, "SEL 12/24  HOLD menu");
 }
 
 void drawHeartRate(uint32_t now) {
   drawHeader("HEART RATE");
   const bool pulseDetected = lastBeatTime != 0 && now - lastBeatTime <= 3000;
-  if (!pulseDetected) {
-    heartRate = 0;
-  }
+  if (!pulseDetected) heartRate = 0;
+
   char rateText[16];
-  if (pulseDetected && heartRate > 0) {
-    snprintf(rateText, sizeof(rateText), "%u BPM", heartRate);
-  } else {
-    snprintf(rateText, sizeof(rateText), "-- BPM");
-  }
+  snprintf(rateText, sizeof(rateText), pulseDetected && heartRate > 0 ? "%u BPM" : "-- BPM", heartRate);
   display.setFont(u8g2_font_helvB18_tf);
   display.drawStr(0, 34, rateText);
   display.setFont(u8g2_font_5x8_tf);
-  display.drawStr(88, 31, pulseDetected ? "pulse" : "waiting");
+  display.drawStr(88, 31, pulseDetected ? "LIVE" : "WAITING");
+  display.drawHLine(0, 37, 128);
 
   const size_t count = graphFilled ? GRAPH_WIDTH : graphPosition;
   if (count > 1) {
@@ -340,33 +494,110 @@ void drawHeartRate(uint32_t now) {
     for (size_t i = 1; i < count; ++i) {
       const size_t previous = graphFilled ? (graphPosition + i - 1) % GRAPH_WIDTH : i - 1;
       const size_t current = graphFilled ? (graphPosition + i) % GRAPH_WIDTH : i;
-      const int y1 = 62 - ((graph[previous] - minimum) * 25 / range);
-      const int y2 = 62 - ((graph[current] - minimum) * 25 / range);
+      const int y1 = 57 - ((graph[previous] - minimum) * 19 / range);
+      const int y2 = 57 - ((graph[current] - minimum) * 19 / range);
       display.drawLine(i - 1, y1, i, y2);
     }
   }
+  display.setFont(u8g2_font_5x8_tf);
+  display.drawStr(3, 63, "L/R modes  HOLD menu");
 }
 
 void drawWeather() {
   drawHeader("WEATHER");
-  if (WIFI_SSID[0] == '\0') {
-    display.drawStr(0, 31, "Set Wi-Fi in sketch");
-    display.drawStr(0, 47, "Then rebuild and upload");
-  } else if (!WEATHER_LOCATION_CONFIGURED) {
-    display.drawStr(0, 31, "Set weather location");
-    display.drawStr(0, 47, "in sketch, then upload");
-  } else if (weatherReady) {
-    char temperatureText[16];
-    snprintf(temperatureText, sizeof(temperatureText), "%.1f C", weatherTemperatureC);
+  const int count = watch.getWeatherCount();
+  if (count > 0) {
+    const Weather &today = watch.getWeatherAt(0);
+    char temperatureText[20];
+    snprintf(temperatureText, sizeof(temperatureText), "%d C", today.temp);
     display.setFont(u8g2_font_helvB18_tf);
-    display.drawStr(0, 37, temperatureText);
+    display.drawStr(0, 44, temperatureText);
     display.setFont(u8g2_font_6x10_tf);
-    display.drawStr(0, 55, weatherDescription(weatherCode));
+    const String city = watch.getWeatherCity();
+    display.drawStr(0, 24, city.c_str());
+    display.drawStr(0, 54, chronosWeatherDescription(today.icon));
+    char rangeText[20];
+    snprintf(rangeText, sizeof(rangeText), "H %d C  L %d C", today.high, today.low);
+    display.setFont(u8g2_font_5x8_tf);
+    display.drawStr(2, 63, rangeText);
   } else {
-    display.drawStr(0, 31, WiFi.status() == WL_CONNECTED ? "Fetching weather..." : "Connecting Wi-Fi...");
+    display.setFont(u8g2_font_6x10_tf);
+    display.drawStr(0, 32, watch.isConnected() ? "Waiting for weather sync" : "Connect Chronos app");
+    display.drawStr(0, 48, "Enable weather in app");
   }
   display.setFont(u8g2_font_5x8_tf);
-  display.drawStr(91, 62, weatherFetching ? "updating" : "SEL refresh");
+  const String updateTime = watch.getWeatherTime();
+  if (updateTime.length()) display.drawStr(87, 63, updateTime.c_str());
+}
+
+void drawMusic() {
+  drawHeader("MUSIC");
+  if (!watch.isConnected()) {
+    display.setFont(u8g2_font_6x10_tf);
+    display.drawStr(0, 32, "Connect Chronos app");
+    display.drawStr(0, 48, "to control phone music");
+    display.setFont(u8g2_font_5x8_tf);
+    display.drawStr(3, 63, "HOLD menu for controls");
+    return;
+  }
+
+  MusicInfo &music = watch.getMusicInfo();
+  const bool playing = music.state != 0;
+  display.setFont(u8g2_font_5x8_tf);
+  display.drawStr(3, 25, playing ? "NOW PLAYING" : "PAUSED");
+  String title = music.title.length() ? music.title : "No track info";
+  if (title.length() > 22) title = title.substring(0, 22);
+  display.drawUTF8(3, 40, title.c_str());
+  display.setFont(u8g2_font_6x10_tf);
+  String artist = music.artist;
+  if (artist.length() > 24) artist = artist.substring(0, 24);
+  display.drawUTF8(3, 52, artist.c_str());
+  display.setFont(u8g2_font_5x8_tf);
+  String appName = music.appName;
+  if (appName.length() > 12) appName = appName.substring(0, 12);
+  display.drawUTF8(3, 63, appName.length() ? appName.c_str() : "L/R track  SEL play/pause");
+}
+
+void drawNotifications() {
+  drawHeader("NOTIFICATIONS");
+  const int count = watch.getNotificationCount();
+  if (count <= 0) {
+    display.setFont(u8g2_font_6x10_tf);
+    display.drawStr(0, 32, watch.isConnected() ? "No notifications" : "Connect Chronos app");
+    display.setFont(u8g2_font_5x8_tf);
+    display.drawStr(3, 63, "HOLD menu");
+    return;
+  }
+
+  if (notificationIndex >= count) notificationIndex = count - 1;
+  Notification &notification = watch.getNotificationAt(notificationIndex);
+  char position[12];
+  snprintf(position, sizeof(position), "%u/%u", notificationIndex + 1, count);
+  display.setFont(u8g2_font_5x8_tf);
+  display.drawStr(98, 25, position);
+  String app = notification.app.length() ? notification.app : "Notification";
+  if (app.length() > 18) app = app.substring(0, 18);
+  display.setFont(u8g2_font_6x10_tf);
+  display.drawUTF8(3, 25, app.c_str());
+
+  String title = notification.title;
+  if (title.length() > 28) title = title.substring(0, 28);
+  display.setFont(u8g2_font_6x10_tf);
+  display.drawUTF8(3, 37, title.c_str());
+
+  String message = notification.message;
+  if (message.length() > 42) message = message.substring(0, 42);
+  const int split = message.lastIndexOf(' ', 20);
+  display.setFont(u8g2_font_5x8_tf);
+  if (split > 0) {
+    const String firstLine = message.substring(0, split);
+    display.drawUTF8(3, 48, firstLine.c_str());
+    const String secondLine = message.substring(split + 1, 42);
+    display.drawUTF8(3, 57, secondLine.c_str());
+  } else {
+    display.drawUTF8(3, 52, message.substring(0, 21).c_str());
+  }
+  display.drawStr(3, 63, "L/R browse  SEL clear");
 }
 
 void drawStopwatch(uint32_t now) {
@@ -380,113 +611,94 @@ void drawStopwatch(uint32_t now) {
            static_cast<unsigned long>(totalSeconds % 60),
            static_cast<unsigned long>((elapsed % 1000) / 100));
   display.setFont(u8g2_font_helvB18_tf);
-  display.drawStr(12, 39, timeText);
+  display.drawStr(12, 38, timeText);
   display.setFont(u8g2_font_6x10_tf);
-  display.drawStr(13, 57, stopwatchRunning ? "SEL pause  HOLD reset" : "SEL start  HOLD reset");
+  if (stopwatchRunning) {
+    char lapText[20];
+    snprintf(lapText, sizeof(lapText), "LAP %u  +%lu.%02lu", lapCount + 1,
+             static_cast<unsigned long>(lastLapElapsedMs / 1000),
+             static_cast<unsigned long>((lastLapElapsedMs % 1000) / 10));
+    display.drawStr(4, 52, lapText);
+  } else {
+    display.drawStr(4, 52, lapCount ? "Paused" : "Ready");
+  }
+  display.setFont(u8g2_font_5x8_tf);
+  display.drawStr(3, 63, stopwatchRunning ? "SEL lap  HOLD menu" : "SEL start  HOLD menu");
 }
 
-void drawCalendar() {
-  drawClock(true);
+void drawFocusTimer(uint32_t now) {
+  drawHeader("FOCUS TIMER");
+  const uint32_t remaining = focusRunning
+      ? focusRemainingMs - (now - focusStartedAt)
+      : focusRemainingMs;
+  const uint32_t totalSeconds = (remaining + 999) / 1000;
+  char timeText[12];
+  snprintf(timeText, sizeof(timeText), "%02lu:%02lu",
+           static_cast<unsigned long>(totalSeconds / 60),
+           static_cast<unsigned long>(totalSeconds % 60));
+  display.setFont(u8g2_font_helvB18_tf);
+  display.drawStr(30, 39, timeText);
+  display.drawFrame(8, 45, 112, 8);
+  const uint32_t elapsed = focusDurationMs - remaining;
+  const uint8_t barWidth = static_cast<uint8_t>((elapsed * 108) / focusDurationMs);
+  if (barWidth) display.drawBox(10, 47, barWidth, 4);
+  display.setFont(u8g2_font_5x8_tf);
+  char presetText[20];
+  snprintf(presetText, sizeof(presetText), "%u MIN", focusDurationMs / 60000UL);
+  display.drawStr(91, 10, presetText);
+  display.drawStr(3, 63, remaining == 0 ? "DONE  MENU TO RESET" :
+                  focusRunning ? "SEL pause  HOLD menu" : "SEL start  HOLD menu");
 }
 
-void drawSystem(uint32_t now) {
+void drawDevice(uint32_t now) {
   drawHeader("DEVICE STATUS");
   display.setFont(u8g2_font_6x10_tf);
   char line[24];
-  snprintf(line, sizeof(line), "Wi-Fi: %s", WIFI_SSID[0] == '\0' ? "not configured" :
-           wifiStatusText());
+  snprintf(line, sizeof(line), "Chronos: %s", watch.isConnected() ? "connected" : "waiting");
   display.drawStr(0, 27, line);
-  if (WiFi.status() == WL_CONNECTED) {
-    snprintf(line, sizeof(line), "IP: %s", WiFi.localIP().toString().c_str());
-  } else {
-    snprintf(line, sizeof(line), "Disconnect reason: %u", lastWifiDisconnectReason);
-  }
+  snprintf(line, sizeof(line), "Phone battery: %u%%", watch.getPhoneBattery());
   display.drawStr(0, 40, line);
   snprintf(line, sizeof(line), "Sensor ADC: %u", analogRead(SENSOR_PIN));
   display.drawStr(0, 53, line);
   display.setFont(u8g2_font_5x8_tf);
-  snprintf(line, sizeof(line), "Uptime %lu min", static_cast<unsigned long>(now / 60000));
+  snprintf(line, sizeof(line), "Up %lu min  Notif %d",
+           static_cast<unsigned long>(now / 60000), watch.getNotificationCount());
   display.drawStr(0, 63, line);
 }
 
-void maintainWiFi(uint32_t now) {
-  if (WIFI_SSID[0] == '\0' || WiFi.status() == WL_CONNECTED ||
-      now - lastWifiAttempt < WIFI_RETRY_INTERVAL_MS) {
-    return;
-  }
-
-  lastWifiAttempt = now;
-  Serial.printf("Wi-Fi: retrying, status=%d, last disconnect reason=%u\n",
-                static_cast<int>(WiFi.status()), lastWifiDisconnectReason);
-  WiFi.reconnect();
-}
-
-void onWiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
-  if (event == ARDUINO_EVENT_WIFI_STA_GOT_IP) {
-    Serial.printf("Wi-Fi connected; IP: %s\n", WiFi.localIP().toString().c_str());
-  } else if (event == ARDUINO_EVENT_WIFI_STA_DISCONNECTED) {
-    lastWifiDisconnectReason = info.wifi_sta_disconnected.reason;
-    Serial.printf("Wi-Fi disconnected; reason=%u\n", lastWifiDisconnectReason);
+void onChronosConnection(bool connected) {
+  Serial.printf("Chronos phone %s\n", connected ? "connected" : "disconnected");
+  if (!connected) {
+    chronosSyncRequested = false;
   }
 }
 
-const char *wifiStatusText() {
-  switch (WiFi.status()) {
-    case WL_CONNECTED: return "connected";
-    case WL_NO_SSID_AVAIL: return "SSID not found";
-    case WL_CONNECT_FAILED: return "auth/connect failed";
-    case WL_CONNECTION_LOST: return "connection lost";
-    case WL_DISCONNECTED: return "disconnected";
-    default: return "connecting";
+void onChronosNotification(Notification notification) {
+  notificationReceived = true;
+  Serial.printf("Notification from %s: %s\n",
+                notification.app.c_str(), notification.title.c_str());
+}
+
+void onChronosConfiguration(Config config, uint32_t a, uint32_t b) {
+  (void)b;
+  if (config == CF_TIME && a == 1) {
+    chronosTimeSynced = true;
+    Serial.println("Time synced from Chronos app");
+  } else if (config == CF_HR24) {
+    use24HourClock = watch.is24Hour();
   }
 }
 
-void weatherWorker(void *parameter) {
-  (void)parameter;
-  for (;;) {
-    const uint32_t now = millis();
-    if (WEATHER_LOCATION_CONFIGURED && WiFi.status() == WL_CONNECTED &&
-        (weatherRefreshRequested || lastWeatherRequest == 0 ||
-         now - lastWeatherRequest >= WEATHER_INTERVAL_MS)) {
-      weatherRefreshRequested = false;
-      weatherFetching = true;
-      lastWeatherRequest = now;
-
-      WiFiClientSecure client;
-      client.setInsecure();
-      HTTPClient http;
-      char url[220];
-      snprintf(url, sizeof(url),
-               "https://api.open-meteo.com/v1/forecast?latitude=%.4f&longitude=%.4f&current=temperature_2m,weather_code&timezone=auto",
-               WEATHER_LATITUDE, WEATHER_LONGITUDE);
-      http.setTimeout(5000);
-      if (http.begin(client, url)) {
-        const int status = http.GET();
-        if (status == HTTP_CODE_OK) {
-          JsonDocument document;
-          const DeserializationError error = deserializeJson(document, http.getString());
-          if (!error && document["current"]["temperature_2m"].is<float>()) {
-            weatherTemperatureC = document["current"]["temperature_2m"].as<float>();
-            weatherCode = document["current"]["weather_code"] | -1;
-            weatherReady = true;
-          }
-        }
-        http.end();
-      }
-      weatherFetching = false;
-    }
-    vTaskDelay(pdMS_TO_TICKS(1000));
+const char *chronosWeatherDescription(int icon) {
+  switch (icon) {
+    case 0: return "Partly cloudy";
+    case 1: return "Sunny";
+    case 2: return "Snow";
+    case 3: return "Rain";
+    case 4: return "Cloudy";
+    case 5: return "Extreme weather";
+    case 6: return "Windy";
+    case 7: return "Haze / fog";
+    default: return "Forecast";
   }
-}
-
-const char *weatherDescription(int code) {
-  if (code == 0) return "Clear sky";
-  if (code <= 3 && code >= 1) return "Partly cloudy";
-  if (code == 45 || code == 48) return "Fog";
-  if (code >= 51 && code <= 57) return "Drizzle";
-  if (code >= 61 && code <= 67) return "Rain";
-  if (code >= 71 && code <= 77) return "Snow";
-  if (code >= 80 && code <= 82) return "Showers";
-  if (code >= 95) return "Thunderstorm";
-  return "Unknown conditions";
 }
