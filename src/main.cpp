@@ -14,6 +14,8 @@ constexpr uint32_t GRAPH_INTERVAL_MS = 50;
 constexpr uint32_t DISPLAY_INTERVAL_MS = 150;
 constexpr uint32_t BUTTON_DEBOUNCE_MS = 30;
 constexpr uint32_t SELECT_LONG_PRESS_MS = 900;
+constexpr uint32_t IDLE_TIMEOUT_MS = 10UL * 1000UL;
+constexpr uint32_t EYE_SLEEP_DURATION_MS = 5UL * 1000UL;
 constexpr uint32_t MIN_BEAT_INTERVAL_MS = 300;
 constexpr uint32_t MAX_BEAT_INTERVAL_MS = 2000;
 constexpr uint32_t FOCUS_DURATION_MS = 25UL * 60UL * 1000UL;
@@ -83,6 +85,8 @@ uint16_t heartRate = 0;
 uint32_t lastSampleTime = 0;
 uint32_t lastGraphTime = 0;
 uint32_t lastDisplayTime = 0;
+uint32_t lastUserActivityTime = 0;
+uint32_t eyeAnimationStartedAt = 0;
 uint32_t stopwatchStartedAt = 0;
 uint32_t stopwatchElapsedMs = 0;
 uint32_t lastLapElapsedMs = 0;
@@ -106,6 +110,7 @@ bool menuOpen = false;
 bool use24HourClock = true;
 bool stopwatchRunning = false;
 bool focusRunning = false;
+uint8_t idleDisplayState = 0;
 volatile bool chronosTimeSynced = false;
 volatile bool notificationReceived = false;
 bool chronosSyncRequested = false;
@@ -117,6 +122,7 @@ void addGraphSample(uint16_t sample);
 void updateFocusTimer(uint32_t now);
 void updateRunner(uint32_t now);
 void drawScreen(uint32_t now);
+void drawSleepyEyes();
 void drawMenu();
 void drawClock(bool showDate);
 void drawHeartRate(uint32_t now);
@@ -164,6 +170,7 @@ void setup() {
   lastSampleTime = millis();
   lastGraphTime = lastSampleTime;
   lastDisplayTime = lastSampleTime;
+  lastUserActivityTime = lastSampleTime;
 
 }
 
@@ -212,6 +219,14 @@ void updateButtons(uint32_t now) {
       if (!button.stableHigh) {
         button.pressedAt = now;
         button.longPressHandled = false;
+        if (idleDisplayState != 0) {
+          idleDisplayState = 0;
+          lastUserActivityTime = now;
+          button.longPressHandled = true;
+          display.setPowerSave(0);
+          continue;
+        }
+        lastUserActivityTime = now;
         if (i == 0) {
           if (menuOpen) {
             menuSelection = (menuSelection + MENU_ITEM_COUNT - 1) % MENU_ITEM_COUNT;
@@ -406,6 +421,26 @@ void updateRunner(uint32_t now) {
 }
 
 void drawScreen(uint32_t now) {
+  if (idleDisplayState == 0 && now - lastUserActivityTime >= IDLE_TIMEOUT_MS) {
+    idleDisplayState = 1;
+    eyeAnimationStartedAt = now;
+  }
+
+  if (idleDisplayState == 2) return;
+
+  if (idleDisplayState == 1) {
+    if (now - eyeAnimationStartedAt >= EYE_SLEEP_DURATION_MS) {
+      display.clearBuffer();
+      display.sendBuffer();
+      display.setPowerSave(1);
+      idleDisplayState = 2;
+      return;
+    }
+    drawSleepyEyes();
+    display.sendBuffer();
+    return;
+  }
+
   display.clearBuffer();
   if (menuOpen) {
     drawMenu();
@@ -425,6 +460,13 @@ void drawScreen(uint32_t now) {
     }
   }
   display.sendBuffer();
+}
+
+void drawSleepyEyes() {
+  display.clearBuffer();
+  display.setDrawColor(1);
+  display.drawRBox(19, 31, 40, 2, 0);
+  display.drawRBox(69, 31, 40, 2, 0);
 }
 
 void drawHeader(const char *title) {
