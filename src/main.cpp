@@ -4,7 +4,7 @@
 #include <ChronosESP32.h>
 
 constexpr uint8_t BUTTON_LEFT_PIN = 2;
-constexpr uint8_t BUTTON_RIGHT_PIN = 3;
+constexpr uint8_t BUTTON_RIGHT_PIN = 1;
 constexpr uint8_t BUTTON_SELECT_PIN = 10;
 constexpr uint8_t SENSOR_PIN = 0;
 constexpr uint8_t OLED_SDA_PIN = 4;
