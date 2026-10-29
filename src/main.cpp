@@ -32,6 +32,7 @@ enum class Mode : uint8_t {
   Calendar,
   FocusTimer,
   Device,
+  Runner,
   Count
 };
 
@@ -64,7 +65,7 @@ constexpr uint8_t MENU_ITEM_COUNT = MENU_FOCUS_PRESET_START + FOCUS_PRESET_COUNT
 const uint8_t FOCUS_PRESET_MINUTES[FOCUS_PRESET_COUNT] = {5, 15, 25, 45};
 const char *const MODE_NAMES[MODE_COUNT] = {
   "Clock", "Heart rate", "Chronos weather", "Music", "Notifications",
-  "Stopwatch", "Calendar", "Focus timer", "Device status"
+  "Stopwatch", "Calendar", "Focus timer", "Device status", "Lane runner"
 };
 const char *const WEEKDAYS[] = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
 const char *const MONTHS[] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun",
@@ -89,6 +90,14 @@ uint32_t stopwatchLapMarkMs = 0;
 uint32_t focusStartedAt = 0;
 uint32_t focusDurationMs = FOCUS_DURATION_MS;
 uint32_t focusRemainingMs = FOCUS_DURATION_MS;
+uint32_t runnerLastStepAt = 0;
+uint32_t runnerJumpUntil = 0;
+uint16_t runnerScore = 0;
+int16_t runnerObstacleX = 128;
+uint8_t runnerLane = 1;
+uint8_t runnerObstacleLane = 1;
+bool runnerActive = false;
+bool runnerGameOver = false;
 uint8_t lapCount = 0;
 uint8_t menuSelection = 0;
 uint8_t notificationIndex = 0;
@@ -106,6 +115,7 @@ void handleSelect(bool longPress);
 void samplePulseSensor(uint32_t now);
 void addGraphSample(uint16_t sample);
 void updateFocusTimer(uint32_t now);
+void updateRunner(uint32_t now);
 void drawScreen(uint32_t now);
 void drawMenu();
 void drawClock(bool showDate);
@@ -114,6 +124,7 @@ void drawWeather();
 void drawStopwatch(uint32_t now);
 void drawFocusTimer(uint32_t now);
 void drawDevice(uint32_t now);
+void drawRunner(uint32_t now);
 void drawMusic();
 void drawNotifications();
 void drawHeader(const char *title);
@@ -149,6 +160,7 @@ void setup() {
 
   rawSample = analogRead(SENSOR_PIN);
   baseline = rawSample;
+  randomSeed((static_cast<uint32_t>(analogRead(SENSOR_PIN)) << 16) ^ micros());
   lastSampleTime = millis();
   lastGraphTime = lastSampleTime;
   lastDisplayTime = lastSampleTime;
@@ -170,6 +182,7 @@ void loop() {
   }
   updateButtons(now);
   updateFocusTimer(now);
+  updateRunner(now);
 
   if (now - lastSampleTime >= SAMPLE_INTERVAL_MS) {
     lastSampleTime = now;
@@ -207,6 +220,8 @@ void updateButtons(uint32_t now) {
           } else if (currentMode == Mode::Notifications) {
             const int count = watch.getNotificationCount();
             if (count > 0 && notificationIndex + 1 < count) ++notificationIndex;
+          } else if (currentMode == Mode::Runner) {
+            if (runnerLane > 0) --runnerLane;
           } else {
             currentMode = static_cast<Mode>(
                 (static_cast<uint8_t>(currentMode) + MODE_COUNT - 1) % MODE_COUNT);
@@ -218,6 +233,8 @@ void updateButtons(uint32_t now) {
             if (watch.isConnected()) watch.musicControl(MUSIC_NEXT);
           } else if (currentMode == Mode::Notifications) {
             if (notificationIndex > 0) --notificationIndex;
+          } else if (currentMode == Mode::Runner) {
+            if (runnerLane < 2) ++runnerLane;
           } else {
             currentMode = static_cast<Mode>(
                 (static_cast<uint8_t>(currentMode) + 1) % MODE_COUNT);
@@ -290,6 +307,19 @@ void handleSelect(bool longPress) {
   } else if (currentMode == Mode::Notifications) {
     watch.clearNotifications();
     notificationIndex = 0;
+  } else if (currentMode == Mode::Runner) {
+    if (!runnerActive || runnerGameOver) {
+      runnerActive = true;
+      runnerGameOver = false;
+      runnerScore = 0;
+      runnerLane = 1;
+      runnerObstacleLane = random(0, 3);
+      runnerObstacleX = 128;
+      runnerJumpUntil = 0;
+      runnerLastStepAt = millis();
+    } else {
+      runnerJumpUntil = millis() + 650;
+    }
   } else if (currentMode == Mode::Stopwatch) {
     if (stopwatchRunning) {
       const uint32_t elapsed = stopwatchElapsedMs + millis() - stopwatchStartedAt;
@@ -354,6 +384,27 @@ void updateFocusTimer(uint32_t now) {
   }
 }
 
+void updateRunner(uint32_t now) {
+  if (!runnerActive || runnerGameOver || now - runnerLastStepAt < 35) return;
+  runnerLastStepAt = now;
+
+  const uint8_t speed = min<uint8_t>(7, 3 + runnerScore / 5);
+  runnerObstacleX -= speed;
+  if (runnerObstacleX <= 25 && runnerObstacleX >= 7 &&
+      runnerObstacleLane == runnerLane &&
+      static_cast<int32_t>(now - runnerJumpUntil) >= 0) {
+    runnerGameOver = true;
+    runnerActive = false;
+    return;
+  }
+
+  if (runnerObstacleX < -8) {
+    ++runnerScore;
+    runnerObstacleX = 128 + random(0, 42);
+    runnerObstacleLane = random(0, 3);
+  }
+}
+
 void drawScreen(uint32_t now) {
   display.clearBuffer();
   if (menuOpen) {
@@ -369,6 +420,7 @@ void drawScreen(uint32_t now) {
       case Mode::Calendar: drawClock(true); break;
       case Mode::FocusTimer: drawFocusTimer(now); break;
       case Mode::Device: drawDevice(now); break;
+      case Mode::Runner: drawRunner(now); break;
       case Mode::Count: currentMode = Mode::Clock; drawClock(false); break;
     }
   }
@@ -648,6 +700,44 @@ void drawFocusTimer(uint32_t now) {
   display.drawStr(91, 10, presetText);
   display.drawStr(3, 63, remaining == 0 ? "DONE  MENU TO RESET" :
                   focusRunning ? "SEL pause  HOLD menu" : "SEL start  HOLD menu");
+}
+
+void drawRunner(uint32_t now) {
+  drawHeader("LANE RUNNER");
+  char scoreText[16];
+  snprintf(scoreText, sizeof(scoreText), "SCORE %u", runnerScore);
+  display.setFont(u8g2_font_5x8_tf);
+  display.drawStr(3, 23, scoreText);
+
+  const uint8_t laneY[] = {32, 45, 58};
+  for (uint8_t lane = 0; lane < 3; ++lane) {
+    display.drawHLine(8, laneY[lane] + 4, 112);
+  }
+
+  if (!runnerActive && !runnerGameOver) {
+    display.setDrawColor(1);
+    display.drawBox(15, laneY[runnerLane] - 3, 9, 7);
+    display.setFont(u8g2_font_6x10_tf);
+    display.drawStr(35, 40, "SEL TO START");
+    display.setFont(u8g2_font_5x8_tf);
+    display.drawStr(3, 63, "L/R lane  SEL jump");
+    return;
+  }
+
+  if (runnerGameOver) {
+    display.setFont(u8g2_font_helvB14_tf);
+    display.drawStr(34, 43, "CRASH!");
+    display.setFont(u8g2_font_5x8_tf);
+    display.drawStr(3, 63, "SEL retry  HOLD menu");
+    return;
+  }
+
+  const bool jumping = static_cast<int32_t>(now - runnerJumpUntil) < 0;
+  const int playerY = laneY[runnerLane] - 3 - (jumping ? 6 : 0);
+  display.drawBox(15, playerY, 9, 7);
+  display.drawFrame(runnerObstacleX, laneY[runnerObstacleLane] - 4, 8, 8);
+  display.setFont(u8g2_font_5x8_tf);
+  display.drawStr(3, 63, "L/R lane  SEL jump");
 }
 
 void drawDevice(uint32_t now) {
