@@ -469,7 +469,9 @@ void updateRunner(uint32_t now) {
 }
 
 void drawScreen(uint32_t now) {
-  if (idleDisplayState == 0 && now - lastUserActivityTime >= IDLE_TIMEOUT_MS) {
+  const bool heartRateScreenActive = currentMode == Mode::HeartRate && !menuOpen;
+  if (!heartRateScreenActive && idleDisplayState == 0 &&
+      now - lastUserActivityTime >= IDLE_TIMEOUT_MS) {
     idleDisplayState = 1;
     eyeAnimationStartedAt = now;
   }
