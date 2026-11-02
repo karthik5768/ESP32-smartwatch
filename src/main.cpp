@@ -17,7 +17,7 @@ constexpr uint32_t BUTTON_DEBOUNCE_MS = 30;
 constexpr uint32_t SELECT_LONG_PRESS_MS = 900;
 constexpr uint32_t IDLE_TIMEOUT_MS = 10UL * 1000UL;
 constexpr uint32_t EYE_SLEEP_DURATION_MS = 5UL * 1000UL;
-constexpr uint32_t MIN_BEAT_INTERVAL_MS = 300;
+constexpr uint32_t MIN_BEAT_INTERVAL_MS = 350;
 constexpr uint32_t MAX_BEAT_INTERVAL_MS = 2000;
 constexpr uint32_t SENSOR_SETTLE_MS = 250;
 constexpr uint32_t FOCUS_DURATION_MS = 25UL * 60UL * 1000UL;
@@ -411,21 +411,25 @@ void samplePulseSensor(uint32_t now) {
   baseline += (static_cast<float>(rawSample) - baseline) * 0.02f;
   const float pulseSignal = static_cast<float>(rawSample) - baseline;
   signalEnvelope += (fabsf(pulseSignal) - signalEnvelope) * 0.05f;
-  const float threshold = max(18.0f, signalEnvelope * 0.55f);
+  const float threshold = max(10.0f, signalEnvelope * 0.45f);
 
   if (pulseSignal > threshold && !aboveThreshold) {
     aboveThreshold = true;
-    if (lastBeatTime != 0) {
+    if (lastBeatTime == 0) {
+      lastBeatTime = now;
+    } else {
       const uint32_t interval = now - lastBeatTime;
-      if (interval >= MIN_BEAT_INTERVAL_MS && interval <= MAX_BEAT_INTERVAL_MS) {
+      if (interval > MAX_BEAT_INTERVAL_MS) {
+        lastBeatTime = now;
+      } else if (interval >= MIN_BEAT_INTERVAL_MS) {
         const uint16_t newRate = 60000U / interval;
         heartRate = heartRate == 0
             ? newRate
             : static_cast<uint16_t>((heartRate * 3U + newRate) / 4U);
+        lastBeatTime = now;
       }
     }
-    lastBeatTime = now;
-  } else if (pulseSignal < threshold * 0.35f) {
+  } else if (pulseSignal < threshold * 0.25f) {
     aboveThreshold = false;
   }
 }
