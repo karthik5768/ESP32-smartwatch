@@ -7,6 +7,7 @@ constexpr uint8_t BUTTON_LEFT_PIN = 2;
 constexpr uint8_t BUTTON_RIGHT_PIN = 1;
 constexpr uint8_t BUTTON_SELECT_PIN = 10;
 constexpr uint8_t SENSOR_PIN = 0;
+constexpr uint8_t SENSOR_POWER_PIN = 7;
 constexpr uint8_t OLED_SDA_PIN = 4;
 constexpr uint8_t OLED_SCL_PIN = 5;
 constexpr uint32_t SAMPLE_INTERVAL_MS = 20;
@@ -18,6 +19,7 @@ constexpr uint32_t IDLE_TIMEOUT_MS = 10UL * 1000UL;
 constexpr uint32_t EYE_SLEEP_DURATION_MS = 5UL * 1000UL;
 constexpr uint32_t MIN_BEAT_INTERVAL_MS = 300;
 constexpr uint32_t MAX_BEAT_INTERVAL_MS = 2000;
+constexpr uint32_t SENSOR_SETTLE_MS = 250;
 constexpr uint32_t FOCUS_DURATION_MS = 25UL * 60UL * 1000UL;
 constexpr size_t GRAPH_WIDTH = 128;
 
@@ -87,6 +89,7 @@ uint32_t lastGraphTime = 0;
 uint32_t lastDisplayTime = 0;
 uint32_t lastUserActivityTime = 0;
 uint32_t eyeAnimationStartedAt = 0;
+uint32_t sensorPowerStartedAt = 0;
 uint32_t stopwatchStartedAt = 0;
 uint32_t stopwatchElapsedMs = 0;
 uint32_t lastLapElapsedMs = 0;
@@ -111,6 +114,8 @@ bool use24HourClock = true;
 bool stopwatchRunning = false;
 bool focusRunning = false;
 uint8_t idleDisplayState = 0;
+bool sensorPowered = false;
+bool sensorBaselineInitialized = false;
 volatile bool chronosTimeSynced = false;
 volatile bool notificationReceived = false;
 bool chronosSyncRequested = false;
@@ -118,6 +123,7 @@ bool chronosSyncRequested = false;
 void updateButtons(uint32_t now);
 void handleSelect(bool longPress);
 void samplePulseSensor(uint32_t now);
+void updateSensorPower(uint32_t now);
 void addGraphSample(uint16_t sample);
 void updateFocusTimer(uint32_t now);
 void updateRunner(uint32_t now);
@@ -141,6 +147,8 @@ const char *chronosWeatherDescription(int icon);
 
 void setup() {
   Serial.begin(115200);
+  pinMode(SENSOR_POWER_PIN, OUTPUT);
+  digitalWrite(SENSOR_POWER_PIN, LOW);
   analogReadResolution(12);
   analogSetPinAttenuation(SENSOR_PIN, ADC_11db);
 
@@ -164,9 +172,9 @@ void setup() {
   Serial.println("Pair in Chronos app: Watches > Pair New Devices > Search.");
   Serial.println("Do not pair from the phone's Bluetooth settings.");
 
-  rawSample = analogRead(SENSOR_PIN);
-  baseline = rawSample;
-  randomSeed((static_cast<uint32_t>(analogRead(SENSOR_PIN)) << 16) ^ micros());
+  rawSample = 0;
+  baseline = 0.0f;
+  randomSeed(micros());
   lastSampleTime = millis();
   lastGraphTime = lastSampleTime;
   lastDisplayTime = lastSampleTime;
@@ -188,20 +196,54 @@ void loop() {
     notificationReceived = false;
   }
   updateButtons(now);
+  updateSensorPower(now);
   updateFocusTimer(now);
   updateRunner(now);
 
-  if (now - lastSampleTime >= SAMPLE_INTERVAL_MS) {
+  const bool readyToSample = sensorPowered &&
+      now - sensorPowerStartedAt >= SENSOR_SETTLE_MS;
+  if (readyToSample && now - lastSampleTime >= SAMPLE_INTERVAL_MS) {
     lastSampleTime = now;
     samplePulseSensor(now);
   }
-  if (now - lastGraphTime >= GRAPH_INTERVAL_MS) {
+  if (readyToSample && sensorBaselineInitialized &&
+      now - lastGraphTime >= GRAPH_INTERVAL_MS) {
     lastGraphTime = now;
     addGraphSample(rawSample);
   }
   if (now - lastDisplayTime >= DISPLAY_INTERVAL_MS) {
     lastDisplayTime = now;
     drawScreen(now);
+  }
+}
+
+void updateSensorPower(uint32_t now) {
+  const bool shouldPowerSensor = currentMode == Mode::HeartRate &&
+      !menuOpen && idleDisplayState == 0;
+  if (shouldPowerSensor == sensorPowered) return;
+
+  sensorPowered = shouldPowerSensor;
+  digitalWrite(SENSOR_POWER_PIN, sensorPowered ? HIGH : LOW);
+  sensorPowerStartedAt = now;
+  lastSampleTime = now;
+  lastGraphTime = now;
+
+  if (sensorPowered) {
+    sensorBaselineInitialized = false;
+    rawSample = 0;
+    baseline = 0.0f;
+    signalEnvelope = 0.0f;
+    aboveThreshold = false;
+    lastBeatTime = 0;
+    heartRate = 0;
+    graphPosition = 0;
+    graphFilled = false;
+  } else {
+    sensorBaselineInitialized = false;
+    rawSample = 0;
+    heartRate = 0;
+    lastBeatTime = 0;
+    aboveThreshold = false;
   }
 }
 
@@ -360,6 +402,12 @@ void handleSelect(bool longPress) {
 
 void samplePulseSensor(uint32_t now) {
   rawSample = analogRead(SENSOR_PIN);
+  if (!sensorBaselineInitialized) {
+    baseline = rawSample;
+    signalEnvelope = 0.0f;
+    sensorBaselineInitialized = true;
+    return;
+  }
   baseline += (static_cast<float>(rawSample) - baseline) * 0.02f;
   const float pulseSignal = static_cast<float>(rawSample) - baseline;
   signalEnvelope += (fabsf(pulseSignal) - signalEnvelope) * 0.05f;
@@ -790,7 +838,7 @@ void drawDevice(uint32_t now) {
   display.drawStr(0, 27, line);
   snprintf(line, sizeof(line), "Phone battery: %u%%", watch.getPhoneBattery());
   display.drawStr(0, 40, line);
-  snprintf(line, sizeof(line), "Sensor ADC: %u", analogRead(SENSOR_PIN));
+  snprintf(line, sizeof(line), "Heart sensor: %s", sensorPowered ? "ON" : "OFF");
   display.drawStr(0, 53, line);
   display.setFont(u8g2_font_5x8_tf);
   snprintf(line, sizeof(line), "Up %lu min  Notif %d",
